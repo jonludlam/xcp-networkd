@@ -14,33 +14,47 @@
 
 (* JSON-RPC Client *)
 
+open Stdext
+
 module D = Debug.Make(struct let name = "jsonrpc_client" end)
 open D
 
-let input_json_object fin =
-	let buf = Buffer.create 1024 in
-	let brace_cnt = ref 0 in
-	let in_string = ref false in
-	let last_char () = Buffer.nth buf (Buffer.length buf - 1) in
-	let rec get () =
-		let c = input_char fin in
-		begin
-			match c with
-			| '{' when not !in_string -> brace_cnt := !brace_cnt + 1
-			| '}' when not !in_string -> brace_cnt := !brace_cnt - 1
-			| '"' when !in_string && (last_char () <> '\\') -> in_string := false
-			| '"' when not !in_string -> in_string := true
-			| _ -> ()
-		end;
-		Buffer.add_char buf c;
-		if !brace_cnt > 0 then
-			get ()
-	in
-	get ();
-	Buffer.contents buf
+exception Timeout
+
+let max_len = 65536 (* Arbitrary maximum length of RPC response *)
+
+(* Read the entire contents of the fd, of unknown length *)
+let read fd timeout =
+  let buf = Buffer.create max_len in
+  let rec inner elapsed =
+    let t' = Unix.gettimeofday() in
+    let (ready_to_read, _, _) = Unix.select [fd] [] [] (timeout -. elapsed) in
+    let t = Unix.gettimeofday () -. t' in
+    if List.mem fd ready_to_read
+    then begin
+      let bytes = Bytes.make 4096 '\000' in
+      let n =
+        try
+          Some (Unix.read fd bytes 0 4096)
+        with
+        | Unix.Unix_error(Unix.EAGAIN,_,_)
+        | Unix.Unix_error(Unix.EWOULDBLOCK,_,_) -> (* Only happens rarely due to select *)
+          None
+      in
+      match n with
+        | None -> inner (elapsed +. t)
+        | Some 0 -> Buffer.contents buf (* EOF *)
+        | Some n ->
+          Buffer.add_substring buf bytes 0 n;
+          inner (elapsed +. t)
+    end else if elapsed +. t > timeout
+    then begin
+      raise Timeout
+    end else inner (elapsed +. t)
+  in inner 0.0
 
 let receive fin =
-	let obj = input_json_object fin in
+	let obj = read fd 60.0 in
 	debug "Response: %s" obj;
 	Jsonrpc.response_of_string obj
 
@@ -54,12 +68,13 @@ let with_connection sockaddr f =
 	result
 
 let with_rpc ?(version=Jsonrpc.V2) ~path ~call () =
-	let sockaddr = Unix.ADDR_UNIX path in
-	with_connection sockaddr (fun fin fout ->
-		let req = Jsonrpc.string_of_call ~version call in
-		debug "Request: %s" req;
-		output_string fout req;
-		flush fout;
-		receive fin
-	)
-
+  let uri = Printf.sprintf "file://%s" path in
+  Open_uri.with_open_uri uri (fun s ->
+      Unix.set_nonblock s;
+      let req = Jsonrpc.string_of_call ~version call in
+      Unixext.time_limited_write s (String.length req) req 60.0;
+      let res = read fd 60.0 in
+      debug "Response: %s" obj;
+      Jsonrpc.response_of_string obj
+    )
+    
